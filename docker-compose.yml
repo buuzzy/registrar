@@ -1,0 +1,49 @@
+services:
+  registrar:
+    build: ./registrar
+    container_name: openai-registrar
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/tokens:/app/tokens
+      - ./data/keys:/app/keys
+      - ./data/logs:/app/logs
+      - cli-proxy-auths:/app/cli-proxy-auths
+    env_file: .env
+    environment:
+      - PROXY_URL=http://host.docker.internal:${PROXY_PORT:-7897}
+      - CLI_PROXY_AUTHS_DIR=/app/cli-proxy-auths
+      - TOKEN_OUTPUT_DIR=tokens
+      - KEYS_DIR=keys
+      - OPENAI_SSL_VERIFY=0
+      - IMAP_HOST=imap.gmail.com
+      - IMAP_PORT=993
+      - IMAP_SSL=1
+      - IMAP_FOLDER=INBOX
+      - IMAP_TIMEOUT_SECONDS=300
+      - IMAP_POLL_SECONDS=3
+      - IMAP_LOOKBACK_SECONDS=600
+      - IMAP_DEBUG=1
+      - IMAP_FETCH_LIMIT=100
+      - IMAP_STRICT_RECIPIENT=1
+    restart: unless-stopped
+
+  cli-proxy:
+    image: eceasy/cli-proxy-api-plus:latest
+    container_name: cli-proxy-api
+    ports:
+      - "8317:8317"
+    volumes:
+      - ./cli-proxy/config.yaml:/CLIProxyAPI/config.yaml
+      - ./cli-proxy/entrypoint.sh:/entrypoint.sh:ro
+      - cli-proxy-auths:/root/.cli-proxy-api
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      - HTTP_PROXY=http://host.docker.internal:${PROXY_PORT:-7897}
+      - HTTPS_PROXY=http://host.docker.internal:${PROXY_PORT:-7897}
+      - CLI_PROXY_API_KEY=${CLI_PROXY_API_KEY:-sk-change-me-to-your-key}
+      - CLI_PROXY_MANAGEMENT_KEY=${CLI_PROXY_MANAGEMENT_KEY:-admin123}
+    restart: unless-stopped
+
+volumes:
+  cli-proxy-auths:

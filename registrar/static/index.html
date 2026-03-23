@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenAI 批量注册控制台</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .log-window {
+      font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      background: #0d1117;
+      color: #c9d1d9;
+    }
+    .log-window::-webkit-scrollbar { width: 6px; }
+    .log-window::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen" x-data="app()" x-init="init()">
+
+  <!-- Header -->
+  <header class="bg-white border-b shadow-sm">
+    <div class="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
+      <h1 class="text-xl font-bold text-gray-800">OpenAI 批量注册控制台</h1>
+      <span class="text-sm text-gray-400">V0.5</span>
+    </div>
+  </header>
+
+  <main class="max-w-5xl mx-auto px-6 py-6 space-y-6">
+
+    <!-- 状态面板 -->
+    <section class="bg-white rounded-xl shadow-sm border p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-700">环境状态</h2>
+        <button @click="checkStatus()" class="text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 px-3 py-1.5 rounded-lg transition">
+          刷新检查
+        </button>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <template x-for="item in statusItems" :key="item.label">
+          <div class="flex items-center space-x-2 p-3 bg-gray-50 rounded-lg">
+            <div class="w-3 h-3 rounded-full flex-shrink-0"
+                 :class="item.ok ? 'bg-green-400' : 'bg-red-400'"></div>
+            <div>
+              <div class="text-xs text-gray-500" x-text="item.label"></div>
+              <div class="text-sm font-medium text-gray-700 truncate" x-text="item.value"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- 注册控制 -->
+    <section class="bg-white rounded-xl shadow-sm border p-6">
+      <h2 class="text-lg font-semibold text-gray-700 mb-4">注册控制</h2>
+      <div class="flex items-center space-x-4">
+        <div class="flex items-center space-x-2">
+          <label class="text-sm text-gray-600">注册数量</label>
+          <input type="number" x-model.number="regCount" min="1" max="50"
+                 class="w-20 px-3 py-2 border rounded-lg text-center focus:ring-2 focus:ring-blue-300 focus:outline-none"
+                 :disabled="registering">
+        </div>
+        <button @click="startRegister()"
+                :disabled="registering"
+                class="px-5 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 text-white rounded-lg font-medium transition">
+          <span x-show="!registering">开始注册</span>
+          <span x-show="registering">注册中...</span>
+        </button>
+        <button x-show="registering" @click="stopRegister()"
+                class="px-5 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg font-medium transition">
+          停止
+        </button>
+      </div>
+
+      <!-- 进度条 -->
+      <div x-show="stats" class="mt-4" x-cloak>
+        <div class="flex items-center justify-between text-sm text-gray-500 mb-1">
+          <span>进度: <span class="font-medium text-gray-700" x-text="stats?.success + '/' + stats?.target"></span></span>
+          <span>失败: <span x-text="stats?.fail || 0"></span> | 重试: <span x-text="stats?.retry || 0"></span></span>
+        </div>
+        <div class="w-full bg-gray-200 rounded-full h-2.5">
+          <div class="bg-blue-500 h-2.5 rounded-full transition-all duration-500"
+               :style="'width: ' + (stats ? Math.round(stats.success / stats.target * 100) : 0) + '%'"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 实时日志 -->
+    <section class="bg-white rounded-xl shadow-sm border overflow-hidden">
+      <div class="flex items-center justify-between px-6 py-3 border-b bg-gray-50">
+        <h2 class="text-lg font-semibold text-gray-700">实时日志</h2>
+        <button @click="logs = []" class="text-xs text-gray-400 hover:text-gray-600">清空</button>
+      </div>
+      <div class="log-window h-72 overflow-y-auto px-4 py-3" x-ref="logWindow">
+        <template x-for="(line, i) in logs" :key="i">
+          <div x-text="line"
+               :class="{
+                 'text-green-400': line.includes('成功'),
+                 'text-red-400': line.includes('Error') || line.includes('失败') || line.includes('熔断'),
+                 'text-yellow-400': line.includes('Warn') || line.includes('重试'),
+                 'text-cyan-400': line.includes('>>>'),
+               }"></div>
+        </template>
+        <div x-show="logs.length === 0" class="text-gray-600 text-center py-8">等待注册任务启动...</div>
+      </div>
+    </section>
+
+    <!-- 账号列表 -->
+    <section class="bg-white rounded-xl shadow-sm border p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-700">已注册账号 (<span x-text="accounts.length"></span>)</h2>
+        <button @click="loadAccounts()" class="text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 px-3 py-1.5 rounded-lg transition">
+          刷新
+        </button>
+      </div>
+      <div x-show="accounts.length > 0" class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b text-left text-gray-500">
+              <th class="pb-2 pr-4">#</th>
+              <th class="pb-2 pr-4">邮箱</th>
+              <th class="pb-2">密码</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(acct, i) in accounts" :key="i">
+              <tr class="border-b last:border-0 hover:bg-gray-50">
+                <td class="py-2 pr-4 text-gray-400" x-text="i + 1"></td>
+                <td class="py-2 pr-4 font-mono text-gray-700" x-text="acct.email"></td>
+                <td class="py-2 font-mono text-gray-500" x-text="acct.password"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div x-show="accounts.length === 0" class="text-center text-gray-400 py-4">暂无已注册账号</div>
+    </section>
+
+    <!-- 连接信息 -->
+    <section class="bg-blue-50 border border-blue-200 rounded-xl p-6">
+      <h2 class="text-lg font-semibold text-blue-700 mb-3">Codex / Cursor 连接配置</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+        <div>
+          <span class="text-blue-600">Base URL:</span>
+          <code class="ml-2 bg-white px-2 py-1 rounded border text-gray-700">http://localhost:8317/v1</code>
+        </div>
+        <div>
+          <span class="text-blue-600">API Key:</span>
+          <code class="ml-2 bg-white px-2 py-1 rounded border text-gray-700">见 .env 中 CLI_PROXY_API_KEY</code>
+        </div>
+        <div>
+          <span class="text-blue-600">CLI Proxy 管理面板:</span>
+          <a href="http://localhost:8317/management.html" target="_blank"
+             class="ml-2 text-blue-500 hover:underline">http://localhost:8317/management.html</a>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    function app() {
+      return {
+        statusItems: [],
+        regCount: 5,
+        registering: false,
+        stats: null,
+        logs: [],
+        accounts: [],
+        eventSource: null,
+
+        async init() {
+          await this.checkStatus();
+          await this.loadAccounts();
+        },
+
+        async checkStatus() {
+          try {
+            const res = await fetch('/api/status');
+            const d = await res.json();
+            this.registering = d.registering;
+            this.stats = d.stats;
+            this.statusItems = [
+              { label: '域名', value: d.mail_domain || '未配置', ok: d.env_ok },
+              { label: 'IMAP', value: d.imap_ok ? '已连接' : d.imap_msg, ok: d.imap_ok },
+              { label: '代理 IP', value: d.proxy_ip || '未连接', ok: d.proxy_ok },
+              { label: '代理地区', value: d.proxy_loc || '-', ok: d.proxy_ok },
+              { label: '已注册', value: d.account_count + ' 个', ok: d.account_count > 0 },
+            ];
+            if (d.registering && !this.eventSource) {
+              this.connectSSE();
+            }
+          } catch (e) {
+            console.error('status check failed', e);
+          }
+        },
+
+        async startRegister() {
+          if (this.registering) return;
+          try {
+            const res = await fetch('/api/register', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ count: this.regCount }),
+            });
+            const d = await res.json();
+            if (res.ok) {
+              this.registering = true;
+              this.logs = [];
+              this.connectSSE();
+            } else {
+              alert(d.error || '启动失败');
+            }
+          } catch (e) {
+            alert('请求失败: ' + e.message);
+          }
+        },
+
+        async stopRegister() {
+          try {
+            await fetch('/api/register/stop', { method: 'POST' });
+          } catch (e) {
+            console.error(e);
+          }
+        },
+
+        connectSSE() {
+          if (this.eventSource) {
+            this.eventSource.close();
+          }
+          const es = new EventSource('/api/register/stream');
+          this.eventSource = es;
+
+          es.addEventListener('log', (e) => {
+            this.logs.push(e.data);
+            if (this.logs.length > 500) this.logs = this.logs.slice(-300);
+            this.$nextTick(() => {
+              const el = this.$refs.logWindow;
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+          });
+
+          es.addEventListener('progress', (e) => {
+            try {
+              const s = JSON.parse(e.data);
+              this.stats = s;
+              if (!s.running) {
+                this.registering = false;
+                es.close();
+                this.eventSource = null;
+                this.loadAccounts();
+                this.checkStatus();
+              }
+            } catch {}
+          });
+
+          es.onerror = () => {
+            setTimeout(() => this.checkStatus(), 2000);
+          };
+        },
+
+        async loadAccounts() {
+          try {
+            const res = await fetch('/api/accounts');
+            const d = await res.json();
+            this.accounts = d.accounts || [];
+          } catch (e) {
+            console.error(e);
+          }
+        },
+      };
+    }
+  </script>
+</body>
+</html>

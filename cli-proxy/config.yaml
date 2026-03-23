@@ -1,0 +1,33 @@
+host: ''
+port: 8317
+tls:
+  enable: false
+remote-management:
+  allow-remote: true
+# 管理面板密码，首次启动后会自动哈希。修改后需重启容器。
+  secret-key: '$2a$10$LRsN17rGvF9Lc7DGZNpQlOrujU/cJn34UqO0cS93LS64v/KZx55JO'
+  disable-control-panel: false
+  panel-github-repository: 'https://github.com/router-for-me/Cli-Proxy-API-Management-Center'
+auth-dir: '~/.cli-proxy-api'
+# Codex / Cursor 连接时使用的 API Key
+api-keys:
+  - sk-nakocai-2026
+debug: false
+commercial-mode: false
+incognito-browser: true
+logging-to-file: false
+usage-statistics-enabled: false
+# 代理设置：由 docker-compose.yml 的 HTTP_PROXY 环境变量控制
+proxy-url: ''
+force-model-prefix: false
+passthrough-headers: false
+request-retry: 3
+max-retry-credentials: 0
+max-retry-interval: 30
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+routing:
+  strategy: 'round-robin'
+ws-auth: false
+nonstream-keepalive-interval: 0
