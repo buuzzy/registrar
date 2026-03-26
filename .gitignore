@@ -3,3 +3,5 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+temp_*
+knowledge.md

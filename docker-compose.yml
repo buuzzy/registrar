@@ -26,6 +26,9 @@ services:
       - IMAP_DEBUG=1
       - IMAP_FETCH_LIMIT=100
       - IMAP_STRICT_RECIPIENT=1
+      - CLASH_API_URL=http://host.docker.internal:${CLASH_API_PORT:-9090}
+      - CLASH_API_SECRET=${CLASH_API_SECRET:-}
+      - CLASH_GROUP_NAME=GLOBAL
     restart: unless-stopped
 
   cli-proxy:

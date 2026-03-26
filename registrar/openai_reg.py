@@ -1,9 +1,8 @@
 """
-OpenAI 批量自动注册引擎 V0.5
-从 V0.4 迁移，适配 Web 控制台：
-- print() 输出重定向到可配置的日志回调
-- 移除 argparse，暴露 start_batch() 供 server.py 调用
-- 路径适配 Docker 共享卷
+OpenAI 批量自动注册引擎 V0.6
+- Pre-flight Check：启动前全面预检
+- Clash API 自动 IP 轮换
+- 失败即停策略
 """
 
 import json
@@ -18,10 +17,11 @@ import hashlib
 import base64
 import threading
 import shutil
+import http.client
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, List
+from typing import Any, Callable, Dict, Optional, List, Tuple
 import urllib.parse
 import ssl
 import urllib.request
@@ -161,6 +161,193 @@ class BatchStats:
             f"失败: {self.fail}, 重试: {self.retry}, "
             f"耗时: {mins}m{secs}s"
         )
+
+
+# ==========================================
+# Clash API 控制器
+# ==========================================
+
+CLASH_API_URL = os.environ.get("CLASH_API_URL", "").strip()
+CLASH_API_SECRET = os.environ.get("CLASH_API_SECRET", "").strip()
+CLASH_GROUP_NAME = os.environ.get("CLASH_GROUP_NAME", "GLOBAL").strip()
+
+_EXCLUDED_NODE_NAMES = {"DIRECT", "REJECT", "COMPATIBLE", "REJECT-DROP", "PASS"}
+_EXCLUDED_NODE_KEYWORDS = ("官网", "禁", "购买", "续费", "到期", "流量", "订阅")
+_BLOCKED_REGIONS = ("香港", "HK")
+
+
+class ClashController:
+    """通过 mihomo RESTful API（HTTP）控制 Clash 节点切换"""
+
+    def __init__(self, api_url: str, group_name: str = "GLOBAL", secret: str = ""):
+        self._api_url = api_url.rstrip("/")
+        self._group = group_name
+        self._secret = secret
+
+    def _request(self, method: str, path: str, body: Optional[str] = None) -> Tuple[int, str]:
+        parsed = urllib.parse.urlparse(self._api_url)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
+        headers: Dict[str, str] = {}
+        if body:
+            headers["Content-Type"] = "application/json"
+        if self._secret:
+            headers["Authorization"] = f"Bearer {self._secret}"
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+
+    def is_available(self) -> bool:
+        if not self._api_url:
+            return False
+        try:
+            status, _ = self._request("GET", "/proxies")
+            return status == 200
+        except Exception:
+            return False
+
+    def get_all_nodes(self) -> Tuple[List[str], str]:
+        """返回 (所有节点名列表, 当前选中节点)"""
+        status, body = self._request("GET", "/proxies")
+        if status != 200:
+            return [], ""
+        data = json.loads(body)
+        group = data.get("proxies", {}).get(self._group, {})
+        return group.get("all", []), group.get("now", "")
+
+    def get_usable_nodes(self, filter_pattern: Optional[str] = None) -> List[str]:
+        all_nodes, _ = self.get_all_nodes()
+        usable = []
+        for name in all_nodes:
+            if name in _EXCLUDED_NODE_NAMES:
+                continue
+            if any(kw in name for kw in _EXCLUDED_NODE_KEYWORDS):
+                continue
+            if any(region in name for region in _BLOCKED_REGIONS):
+                continue
+            if filter_pattern and filter_pattern not in name:
+                continue
+            usable.append(name)
+        return usable
+
+    def switch_node(self, node_name: str) -> bool:
+        encoded_group = urllib.parse.quote(self._group, safe="")
+        body = json.dumps({"name": node_name})
+        status, _ = self._request("PUT", f"/proxies/{encoded_group}", body)
+        return status == 204
+
+    def get_current_node(self) -> str:
+        _, now = self.get_all_nodes()
+        return now
+
+    def get_current_ip(self, proxy_url: Optional[str] = None) -> Tuple[str, str]:
+        """通过 cloudflare trace 获取 (ip, location)"""
+        try:
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            resp = requests.get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                proxies=proxies, impersonate="safari",
+                verify=_ssl_verify(), timeout=10,
+            )
+            ip_match = re.search(r"^ip=(.+)$", resp.text, re.MULTILINE)
+            loc_match = re.search(r"^loc=(.+)$", resp.text, re.MULTILINE)
+            return (
+                ip_match.group(1).strip() if ip_match else "",
+                loc_match.group(1).strip() if loc_match else "",
+            )
+        except Exception:
+            return "", ""
+
+
+# ==========================================
+# Pre-flight Check
+# ==========================================
+
+def preflight_check(proxy: Optional[str] = None,
+                    clash_api_url: Optional[str] = None,
+                    clash_group: Optional[str] = None) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+
+    mail_domain = os.environ.get("MAIL_DOMAIN", "").strip()
+    imap_user = os.environ.get("IMAP_USER", "").strip()
+    imap_password = os.environ.get("IMAP_PASSWORD", "").strip()
+    env_ok = bool(mail_domain and imap_user and imap_password)
+    results.append({
+        "name": "环境变量",
+        "ok": env_ok,
+        "message": f"域名={mail_domain}" if env_ok else "MAIL_DOMAIN / IMAP_USER / IMAP_PASSWORD 未配置",
+    })
+
+    dir_ok = True
+    dir_msgs = []
+    for d in [TOKEN_DIR, KEYS_DIR, "logs"]:
+        try:
+            os.makedirs(d, exist_ok=True)
+            test_f = os.path.join(d, "_preflight_test")
+            with open(test_f, "w") as f:
+                f.write("ok")
+            os.remove(test_f)
+        except Exception as e:
+            dir_ok = False
+            dir_msgs.append(f"{d}: {e}")
+    results.append({
+        "name": "目录写权限",
+        "ok": dir_ok,
+        "message": "tokens/keys/logs 可写" if dir_ok else "; ".join(dir_msgs),
+    })
+
+    imap_ok, imap_msg = check_imap_connection() if env_ok else (False, "跳过（环境变量未配置）")
+    results.append({"name": "IMAP 邮箱", "ok": imap_ok, "message": imap_msg})
+
+    proxy_ip, proxy_loc = "", ""
+    proxy_ok = False
+    if proxy:
+        try:
+            proxies = {"http": proxy, "https": proxy}
+            trace = requests.get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                proxies=proxies, impersonate="safari",
+                verify=_ssl_verify(), timeout=10,
+            )
+            ip_m = re.search(r"^ip=(.+)$", trace.text, re.MULTILINE)
+            loc_m = re.search(r"^loc=(.+)$", trace.text, re.MULTILINE)
+            proxy_ip = ip_m.group(1).strip() if ip_m else ""
+            proxy_loc = loc_m.group(1).strip() if loc_m else ""
+            if proxy_loc in ("CN", "HK"):
+                proxy_ok = False
+            else:
+                proxy_ok = bool(proxy_ip)
+        except Exception as e:
+            proxy_ip = str(e)[:60]
+    results.append({
+        "name": "代理连通",
+        "ok": proxy_ok,
+        "message": f"IP={proxy_ip} ({proxy_loc})" if proxy_ok else f"失败: {proxy_ip} {proxy_loc}".strip(),
+    })
+
+    api_url = clash_api_url or CLASH_API_URL
+    if api_url:
+        try:
+            secret = CLASH_API_SECRET
+            ctrl = ClashController(api_url, clash_group or CLASH_GROUP_NAME, secret)
+            c_ok = ctrl.is_available()
+            if c_ok:
+                nodes = ctrl.get_usable_nodes()
+                results.append({
+                    "name": "Clash API",
+                    "ok": True,
+                    "message": f"已连接，可用节点 {len(nodes)} 个",
+                })
+            else:
+                results.append({"name": "Clash API", "ok": False, "message": "API 无法连接"})
+        except Exception as e:
+            results.append({"name": "Clash API", "ok": False, "message": str(e)[:80]})
+    else:
+        results.append({"name": "Clash API", "ok": True, "message": "未配置（将使用固定 IP）"})
+
+    return results
 
 
 # ==========================================
@@ -701,14 +888,15 @@ def _generate_password(length: int = 16) -> str:
     return "".join(chars)
 
 
-def run(proxy: Optional[str], thread_safe: bool = False) -> tuple:
+def run(proxy: Optional[str], thread_safe: bool = False,
+        skip_net_check: bool = False) -> tuple:
     proxies: Any = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
 
     s = requests.Session(proxies=proxies, impersonate="safari")
 
-    if not _skip_net_check():
+    if not skip_net_check and not _skip_net_check():
         try:
             trace = s.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies,
                           verify=_ssl_verify(), timeout=10)
@@ -1133,15 +1321,71 @@ def _save_result(token_json: str, password: str) -> Optional[str]:
     return file_path
 
 
-def worker_loop(stats: BatchStats, proxy: str, sleep_min: int = 30, sleep_max: int = 60) -> None:
-    """单线程 Worker 循环，注册直到达标或熔断"""
+def worker_loop(stats: BatchStats, proxy: str, sleep_min: int = 30, sleep_max: int = 60,
+                clash_api_url: Optional[str] = None, clash_group: Optional[str] = None,
+                node_filter: Optional[str] = None) -> None:
+    """单线程 Worker 循环：preflight → 节点轮换 → 注册 → 失败即停"""
+
+    _print("[*] ===== Pre-flight Check =====")
+    checks = preflight_check(proxy, clash_api_url, clash_group)
+    all_ok = True
+    for c in checks:
+        tag = "OK" if c["ok"] else "FAIL"
+        _print(f"  [{tag}] {c['name']}: {c['message']}")
+        if not c["ok"]:
+            all_ok = False
+    if not all_ok:
+        _print("[Error] Pre-flight 检查未通过，终止注册")
+        stats.request_stop()
+        return
+    _print("[*] Pre-flight 全部通过\n")
+
+    controller: Optional[ClashController] = None
+    nodes: List[str] = []
+    api_url = clash_api_url or CLASH_API_URL
+    if api_url:
+        secret = CLASH_API_SECRET
+        controller = ClashController(api_url, clash_group or CLASH_GROUP_NAME, secret)
+        nf = node_filter or os.environ.get("CLASH_NODE_FILTER", "").strip() or None
+        nodes = controller.get_usable_nodes(nf)
+        random.shuffle(nodes)
+        _print(f"[*] Clash 可用节点: {len(nodes)} 个" + (f" (过滤: {nf})" if nf else ""))
+        if not nodes:
+            _print("[Error] 没有可用的 Clash 节点")
+            stats.request_stop()
+            return
+
+    use_clash = bool(controller and nodes)
+    node_idx = 0
     attempt = 0
+    used_ips: set = set()
+
     while not stats.should_stop() and stats.remaining() > 0:
         attempt += 1
         _print(f"\n[*] {datetime.now().strftime('%H:%M:%S')} >>> 第 {attempt} 轮 (已成功 {stats.success}/{stats.target}) <<<")
 
+        if use_clash:
+            node = nodes[node_idx % len(nodes)]
+            if not controller.switch_node(node):
+                _print(f"[Error] 切换节点失败: {node}")
+                stats.request_stop()
+                break
+            time.sleep(1)
+            ip, loc = controller.get_current_ip(proxy)
+            _print(f"[*] 节点: {node} → IP: {ip} ({loc})")
+            if loc in ("CN", "HK"):
+                _print(f"[Error] IP 地区不支持: {loc}，跳过此节点")
+                node_idx += 1
+                stats.add_fail()
+                if stats.should_stop():
+                    break
+                continue
+            used_ips.add(ip)
+            node_idx += 1
+
         try:
-            token_json, password = run(proxy or None, thread_safe=False)
+            token_json, password = run(proxy or None, thread_safe=False,
+                                       skip_net_check=use_clash)
             if stats.should_stop():
                 break
             if token_json == "retry_403":
@@ -1156,23 +1400,25 @@ def worker_loop(stats: BatchStats, proxy: str, sleep_min: int = 30, sleep_max: i
             else:
                 stats.add_fail()
                 _log_error(f"第{attempt}轮注册失败 (proxy={proxy})")
-                _print("[*] 本次注册失败。")
+                _print("[*] 本次注册失败")
         except Exception as e:
             stats.add_fail()
             _log_error(f"第{attempt}轮未捕获异常: {e}")
-            _print(f"[*] 未捕获异常: {e}")
+            _print(f"[Error] 未捕获异常: {e}")
 
         if stats.should_stop():
             break
 
         base_wait = random.randint(sleep_min, sleep_max)
-        backoff = min(stats.consecutive_fails * 15, 120)
         jitter = random.uniform(0, 10)
-        wait_time = base_wait + backoff + jitter
+        wait_time = base_wait + jitter
         _print(f"[*] 休息 {int(wait_time)} 秒...")
         time.sleep(wait_time)
 
-    _print(f"\n[*] 批量注册结束: {stats.summary()}")
+    summary = stats.summary()
+    if use_clash:
+        summary += f", 使用IP数: {len(used_ips)}"
+    _print(f"\n[*] 批量注册结束: {summary}")
 
 
 def get_accounts() -> List[dict]:
