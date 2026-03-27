@@ -24,8 +24,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, List, Tuple
 import urllib.parse
 import ssl
-import urllib.request
-import urllib.error
 import imaplib
 import email
 import socket
@@ -563,8 +561,9 @@ def _imap_fetch_otp(email_addr: str, min_date_ts: Optional[float] = None,
         for attempt in range(imap_login_retries + 1):
             try:
                 if imap_ssl:
-                    ctx = None if _ssl_verify() else ssl._create_unverified_context()
-                    imap_conn = imaplib.IMAP4_SSL(host, imap_port, ssl_context=ctx, timeout=imap_connect_timeout)
+                    imap_conn = imaplib.IMAP4_SSL(host, imap_port,
+                                                  ssl_context=_make_imap_ssl_context(),
+                                                  timeout=imap_connect_timeout)
                 else:
                     imap_conn = imaplib.IMAP4(host, imap_port, timeout=imap_connect_timeout)
                 imap_conn.login(imap_user, imap_password)
@@ -666,6 +665,18 @@ def _imap_fetch_otp(email_addr: str, min_date_ts: Optional[float] = None,
     return ""
 
 
+def _make_imap_ssl_context() -> ssl.SSLContext:
+    """创建兼容性更好的 IMAP SSL 上下文，避免 UNEXPECTED_EOF_WHILE_READING"""
+    if _ssl_verify():
+        return ssl.create_default_context()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    return ctx
+
+
 def check_imap_connection() -> tuple:
     """测试 IMAP 连接，返回 (ok: bool, message: str)"""
     imap_host = os.environ.get("IMAP_HOST", "").strip()
@@ -676,16 +687,25 @@ def check_imap_connection() -> tuple:
     imap_ssl = os.environ.get("IMAP_SSL", "1").strip().lower() not in {"0", "false", "no", "off"}
     default_port = 993 if imap_ssl else 143
     imap_port = int(os.environ.get("IMAP_PORT", str(default_port)) or str(default_port))
+    conn = None
     try:
         if imap_ssl:
-            ctx = None if _ssl_verify() else ssl._create_unverified_context()
-            conn = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=ctx, timeout=10)
+            conn = imaplib.IMAP4_SSL(imap_host, imap_port,
+                                     ssl_context=_make_imap_ssl_context(), timeout=10)
         else:
             conn = imaplib.IMAP4(imap_host, imap_port, timeout=10)
         conn.login(imap_user, imap_password)
-        conn.logout()
+        try:
+            conn.logout()
+        except Exception:
+            pass
         return True, "连接成功"
     except Exception as e:
+        try:
+            if conn is not None:
+                conn.logout()
+        except Exception:
+            pass
         return False, str(e)
 
 
@@ -775,24 +795,19 @@ def _to_int(v: Any) -> int:
         return 0
 
 
-def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
-    body = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-    })
-    try:
-        context = None
-        if not _ssl_verify():
-            context = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-            raw = resp.read()
-            if resp.status != 200:
-                raise RuntimeError(f"token exchange failed: {resp.status}: {raw.decode('utf-8', 'replace')}")
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        raise RuntimeError(f"token exchange failed: {exc.code}: {raw.decode('utf-8', 'replace')}") from exc
+def _post_form(url: str, data: Dict[str, str], proxies: Any = None,
+               timeout: int = 30) -> Dict[str, Any]:
+    resp = requests.post(
+        url, data=data, headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        proxies=proxies, impersonate="safari",
+        verify=_ssl_verify(), timeout=timeout,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"token exchange failed: {resp.status_code}: {resp.text[:300]}")
+    return resp.json()
 
 
 def _post_with_retry(session: requests.Session, url: str, *, headers: Dict[str, Any],
@@ -840,7 +855,8 @@ def generate_oauth_url(*, redirect_uri: str = DEFAULT_REDIRECT_URI,
 
 
 def submit_callback_url(*, callback_url: str, expected_state: str,
-                        code_verifier: str, redirect_uri: str = DEFAULT_REDIRECT_URI) -> str:
+                        code_verifier: str, redirect_uri: str = DEFAULT_REDIRECT_URI,
+                        proxies: Any = None) -> str:
     cb = _parse_callback_url(callback_url)
     if cb["error"]:
         raise RuntimeError(f"oauth error: {cb['error']}: {cb['error_description']}".strip())
@@ -853,7 +869,7 @@ def submit_callback_url(*, callback_url: str, expected_state: str,
     token_resp = _post_form(TOKEN_URL, {
         "grant_type": "authorization_code", "client_id": CLIENT_ID,
         "code": cb["code"], "redirect_uri": redirect_uri, "code_verifier": code_verifier,
-    })
+    }, proxies=proxies)
     access_token = (token_resp.get("access_token") or "").strip()
     refresh_token = (token_resp.get("refresh_token") or "").strip()
     id_token = (token_resp.get("id_token") or "").strip()
@@ -1268,7 +1284,8 @@ def run(proxy: Optional[str], thread_safe: bool = False,
                     if "state=" in callback_in_body:
                         token_json = submit_callback_url(
                             callback_url=callback_in_body, code_verifier=oauth.code_verifier,
-                            redirect_uri=oauth.redirect_uri, expected_state=oauth.state)
+                            redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
+                            proxies=proxies)
                         return token_json, password
                 break
             if not location:
@@ -1277,7 +1294,8 @@ def run(proxy: Optional[str], thread_safe: bool = False,
             if "code=" in next_url and "state=" in next_url:
                 token_json = submit_callback_url(
                     callback_url=next_url, code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri, expected_state=oauth.state)
+                    redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
+                    proxies=proxies)
                 return token_json, password
             current_url = next_url
 

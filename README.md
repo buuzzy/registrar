@@ -11,6 +11,13 @@
 - **自动收码**：通过 IMAP 自动获取 OpenAI 验证码
 - **Token 同步**：注册完成后自动同步到 CLI Proxy，Codex/Cursor 即开即用
 
+## 使用方式
+- 启动 Clash Verge — 确保代理正常工作
+- 启动桥接脚本 — 在 registrar/ 目录下运行 python3 clash-bridge.py（保持终端不关）
+- 启动 Docker 服务 — docker compose up -d
+- 打开 http://localhost:8080 — 填写数量，可选填节点过滤，点击开始注册
+
+
 ## 前置准备
 
 ### 1. 安装 Docker Desktop
