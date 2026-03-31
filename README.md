@@ -11,57 +11,24 @@
 - **自动收码**：通过 IMAP 自动获取 OpenAI 验证码
 - **Token 同步**：注册完成后自动同步到 CLI Proxy，Codex/Cursor 即开即用
 
-## 使用方式
-- 启动 Clash Verge — 确保代理正常工作
-- 启动桥接脚本 — 在 registrar/ 目录下运行 python3 clash-bridge.py（保持终端不关）
-- 启动 Docker 服务 — docker compose up -d
-- 打开 http://localhost:8080 — 填写数量，可选填节点过滤，点击开始注册
+## 前置准备清单
 
+开始之前，确保你已准备好以下材料：
 
-## 前置准备
+- [ ] **Docker Desktop** — [Windows](https://docs.docker.com/desktop/install/windows-install/) / [macOS](https://docs.docker.com/desktop/install/mac-install/)
+- [ ] **Clash Verge** — [下载地址](https://github.com/clash-verge-rev/clash-verge-rev/releases)，已导入代理订阅，能正常翻墙
+- [ ] **Gmail 邮箱** — 已开启两步验证，并生成 16 位应用专用密码
+- [ ] **域名** — 已在 Cloudflare 托管 DNS，并配置 Catch-All 邮件转发到 Gmail
+- [ ] **Python 3** — 仅 macOS 需要（用于运行 `clash-bridge.py`）
 
-### 1. 安装 Docker Desktop
-
-- **macOS**: https://docs.docker.com/desktop/install/mac-install/
-- **Windows**: https://docs.docker.com/desktop/install/windows-install/
-
-安装后确保 Docker Desktop 处于运行状态。
-
-### 2. 安装 Clash Verge
-
-安装 [Clash Verge](https://github.com/clash-verge-rev/clash-verge-rev/releases)，导入你的代理订阅，确保能正常访问外网。
-
-**注意事项：**
-- 默认代理端口为 `7897`（Clash Verge 默认），如果不同请在 `.env` 中修改
-- 建议使用 **Global 模式**，确保所有流量走代理
-- **需要启用 External Controller**（用于自动切换节点，见下方说明）
-
-**启用 API Bridge（必须）：**
-
-由于 macOS Docker 容器无法直接访问 Clash 的 Unix Socket，项目自带一个轻量桥接脚本。在启动 Docker 服务之前，先运行：
-
-```bash
-python3 clash-bridge.py
-```
-
-它会将 Clash 的 Unix Socket API 暴露到 TCP 端口 9090，Docker 容器通过 `host.docker.internal:9090` 即可访问。
-
-终端会显示：
-```
-[Clash Bridge] /tmp/verge/verge-mihomo.sock → 0.0.0.0:9090
-[Clash Bridge] Docker 容器可通过 http://host.docker.internal:9090 访问
-```
-
-保持此终端运行即可。如需自定义端口：`python3 clash-bridge.py 8090`，同时修改 `.env` 中的 `CLASH_API_PORT=8090`。
-
-### 3. 准备 Gmail 邮箱
+### 1. Gmail 应用专用密码
 
 1. 登录 Google 账号 → [安全设置](https://myaccount.google.com/security)
 2. 开启**两步验证**（如果还没开）
-3. 在顶部搜索栏搜索「专用」，找到并进入 **应用专用密码**
+3. 在顶部搜索栏搜索「专用」，找到并进入**应用专用密码**
 4. 创建一个新的应用专用密码，记下 16 位密码（格式如 `xxxx xxxx xxxx xxxx`）
 
-### 4. 准备域名 + Cloudflare 邮件转发
+### 2. 域名 + Cloudflare 邮件转发
 
 1. 在 [Namecheap](https://www.namecheap.com) 或 [Cloudflare](https://www.cloudflare.com) 购买一个 `.com` 域名
 2. 将域名的 DNS 托管到 Cloudflare
@@ -72,15 +39,33 @@ python3 clash-bridge.py
    - 设置 **Catch-All 地址** → 操作选「发送到电子邮件」→ 选你的 Gmail
    - 确保 Catch-All 状态显示「活动」
 
+### 3. Clash Verge 设置
+
+安装 [Clash Verge](https://github.com/clash-verge-rev/clash-verge-rev/releases)，导入代理订阅。
+
+**通用设置：**
+- 默认代理端口为 `7897`（Clash Verge 默认），如果不同请在 `.env` 中修改
+- 建议使用 **Global 模式**，确保所有流量走代理
+- **需要启用 External Controller**（用于自动切换节点）
+
 ## 快速部署
 
 ### 步骤 1：配置环境变量
 
+复制配置模板并编辑：
+
+**Windows (PowerShell):**
+```powershell
+copy .env.example .env
+notepad .env
+```
+
+**macOS (Terminal):**
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，填写 **4 项必填**配置：
+填写 **4 项必填**配置：
 
 ```env
 MAIL_DOMAIN=your-domain.com          # 你的域名
@@ -99,15 +84,36 @@ CLASH_API_SECRET=                       # Clash API 密钥（如有）
 CLASH_NODE_FILTER=                      # 节点过滤，如 "美国"
 ```
 
-### 步骤 2：启动 Clash Bridge
+### 步骤 2：配置 Clash API 访问
 
-确保 Clash Verge 正在运行，然后在项目目录下运行：
+> macOS 和 Windows 的区别仅在这一步。
+
+#### Windows
+
+Windows 上 Clash Verge 直接通过 TCP 暴露 API，Docker 容器可以直接访问，**不需要**运行 bridge 脚本。
+
+只需确保 Clash Verge 的 external-controller 监听地址允许外部访问：
+
+1. 打开 Clash Verge → 设置
+2. 找到 **External Controller** 配置
+3. 将监听地址设为 `0.0.0.0:9090`（默认可能是 `127.0.0.1:9090`，需要改为 `0.0.0.0` 以允许 Docker 容器访问）
+4. 确认后直接进入步骤 3
+
+#### macOS
+
+macOS 上 Clash Verge 使用 Unix Socket 暴露 API，Docker 容器无法直接访问，需要运行桥接脚本：
 
 ```bash
 python3 clash-bridge.py
 ```
 
-保持此终端窗口运行。
+终端会显示：
+```
+[Clash Bridge] /tmp/verge/verge-mihomo.sock → 0.0.0.0:9090
+[Clash Bridge] Docker 容器可通过 http://host.docker.internal:9090 访问
+```
+
+**保持此终端窗口运行**，不要关闭。如需自定义端口：`python3 clash-bridge.py 8090`，同时修改 `.env` 中的 `CLASH_API_PORT=8090`。
 
 ### 步骤 3：启动服务
 
@@ -175,7 +181,7 @@ docker compose up -d
 
 工具通过 Clash Verge 内置的 mihomo RESTful API 实现自动节点切换：
 
-1. `clash-bridge.py` 将 Clash 的 Unix Socket API 桥接为 TCP 端口（默认 9090）
+1. **macOS**：`clash-bridge.py` 将 Clash 的 Unix Socket API 桥接为 TCP 端口（默认 9090）；**Windows**：Clash Verge 直接通过 TCP 暴露 API
 2. Docker 容器通过 `host.docker.internal:9090` 调用 Clash API
 3. 每注册一个账号前，脚本通过 `PUT /proxies/GLOBAL` 切换代理节点
 4. 切换后通过 Cloudflare trace 验证出口 IP 已变化且不在 CN/HK 地区
@@ -218,14 +224,14 @@ docker compose up -d --build
 | 域名 | `.env` 未配置 MAIL_DOMAIN | 检查 `.env` 文件 |
 | IMAP | Gmail 密码错误或两步验证未开启 | 重新生成应用专用密码 |
 | 代理 IP | Clash Verge 未运行或端口不对 | 启动 Clash Verge，检查 PROXY_PORT |
-| Clash | API 无法连接 | 确保 `python3 clash-bridge.py` 正在运行 |
+| Clash | API 无法连接 | **Windows**：确认 external-controller 监听 `0.0.0.0:9090`；**macOS**：确认 `clash-bridge.py` 正在运行 |
 | CLI Proxy | 容器未启动 | `docker compose restart cli-proxy` |
 
 ### Pre-flight 检查失败
 
 - **目录写权限**：重启容器 `docker restart openai-registrar`
 - **代理连通 - 地区不支持**：切换 Clash 节点到非 CN/HK 地区
-- **Clash API - 无法连接**：确认 `python3 clash-bridge.py` 正在运行且 Clash Verge 已启动
+- **Clash API - 无法连接**：**Windows** 检查 Clash Verge 的 external-controller 是否设为 `0.0.0.0:9090`；**macOS** 确认 `clash-bridge.py` 正在运行
 
 ### IMAP 收码超时
 
@@ -240,7 +246,7 @@ registrar/
 ├── docker-compose.yml       # Docker 编排文件
 ├── .env.example             # 配置模板
 ├── .env                     # 你的配置（不要提交到 Git）
-├── clash-bridge.py          # Clash API 桥接脚本（宿主机运行）
+├── clash-bridge.py          # Clash API 桥接脚本（仅 macOS 需要）
 ├── registrar/               # 注册服务
 │   ├── Dockerfile
 │   ├── requirements.txt

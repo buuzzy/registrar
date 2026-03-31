@@ -1,6 +1,10 @@
 """
-Clash API Bridge: TCP → Unix Socket
+Clash API Bridge: TCP → Unix Socket (macOS / Linux only)
 将 Clash Verge 的 Unix Socket API 暴露为 HTTP 端口，供 Docker 容器访问。
+
+Windows 上 Clash Verge 直接通过 TCP 暴露 external-controller，
+Docker 容器可通过 host.docker.internal 直接访问，无需此脚本。
+
 用法: python3 clash-bridge.py [port] [socket_path]
 """
 
@@ -9,6 +13,7 @@ import threading
 import sys
 import os
 import signal
+import platform
 
 DEFAULT_PORT = 9090
 DEFAULT_SOCK = "/tmp/verge/verge-mihomo.sock"
@@ -55,6 +60,13 @@ def handle_client(client_sock, sock_path):
 
 
 def main():
+    if platform.system() == "Windows":
+        print("[Clash Bridge] Windows 上不需要此脚本。")
+        print("[Clash Bridge] Clash Verge 已通过 TCP 暴露 external-controller，")
+        print("[Clash Bridge] Docker 容器可直接通过 host.docker.internal:9090 访问。")
+        print("[Clash Bridge] 请确保 Clash Verge 设置中 external-controller 监听地址为 0.0.0.0:9090")
+        sys.exit(0)
+
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     sock_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_SOCK
 
