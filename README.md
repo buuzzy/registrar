@@ -239,6 +239,40 @@ docker compose up -d --build
 - 检查 Gmail 中是否能收到转发的邮件（可能在垃圾箱）
 - 验证应用专用密码是否正确（注意去掉空格）
 
+### ⚠️ 手机验证（2026-03 起）
+
+**自 2026 年 3 月起，OpenAI 新增了强制手机号验证步骤。** 注册流程在邮箱验证通过、账户创建成功后，会跳转到 `add-phone` 页面要求绑定手机号，且无法跳过：
+
+- `phone/skip` → 404（接口不存在）
+- `phone/later` → 404（接口不存在）
+- 使用已认证 session 重新发起 OAuth → 被重定向回登录页
+
+**影响**：当前仅靠邮箱的全自动注册流程已无法完成最后一步。已注册的存量账号不受影响，可正常使用。
+
+**临时方案**：使用已有的存量账号。如需新增账号，需接入短信接码平台（见下方「未来计划」）。
+
+## 未来计划：接入短信接码平台
+
+为恢复全自动注册能力，计划接入短信接码平台 API，在 `add-phone` 步骤自动完成手机号验证。
+
+### 候选平台
+
+| 平台 | 单次价格 | API 文档 |
+|------|---------|---------|
+| [sms-activate.org](https://sms-activate.org) | ~¥2-3/次 | [API Docs](https://sms-activate.org/en/api2) |
+| [5sim.net](https://5sim.net) | ~¥2-4/次 | [API Docs](https://docs.5sim.net) |
+| [smshub.org](https://smshub.org) | ~¥1-3/次 | [API Docs](https://smshub.org/en/info) |
+
+### 实现思路
+
+1. 在 `.env` 中新增 `SMS_API_KEY` 和 `SMS_PROVIDER` 配置项
+2. 在 `openai_reg.py` 的 `add-phone` 处理逻辑中：
+   - 通过接码平台 API 购买一个临时手机号（指定国家，如美国/英国）
+   - 将手机号提交给 OpenAI 的 `add-phone` API
+   - 轮询接码平台 API 获取短信验证码
+   - 将验证码提交给 OpenAI 完成验证
+3. Web 控制台新增 SMS 相关状态指示灯
+
 ## 目录结构
 
 ```

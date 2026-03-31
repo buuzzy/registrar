@@ -1175,6 +1175,9 @@ def run(proxy: Optional[str], thread_safe: bool = False,
                 if otp_send_resp.status_code == 200:
                     login_otp_sent_at = time.time()
 
+                # 等待 5 秒确保新 OTP 邮件到达，避免抓到注册阶段的旧验证码
+                time.sleep(5)
+
                 login_code = _imap_fetch_otp(addr, min_date_ts=login_otp_sent_at, mark_seen=True, thread_safe=thread_safe)
                 if not login_code:
                     _print("[Error] 未获取到登录验证码")
@@ -1234,64 +1237,237 @@ def run(proxy: Optional[str], thread_safe: bool = False,
             _print("[Error] 未获取 continue_url")
             return None, None
 
-        if any(kw in continue_url for kw in ["codex/consent", "/workspace"]):
-            _print("[*] 进入 workspace 选择流程...")
-            s.get(continue_url, proxies=proxies, verify=_ssl_verify(), timeout=15)
-            auth_cookie = s.cookies.get("oai-client-auth-session")
-            workspace_id = ""
-            if auth_cookie:
-                for seg in auth_cookie.split("."):
-                    decoded = _decode_jwt_segment(seg)
-                    ws = (decoded.get("workspaces") or []) if decoded else []
-                    if ws:
-                        workspace_id = str((ws[0] or {}).get("id") or "").strip()
-                        break
-            if not workspace_id:
-                _print("[Error] Cookie 中无 workspace 信息")
+        # ====== 处理中间页面循环 (add-phone / consent / workspace 等) ======
+        _intermediate_keywords = ["add-phone", "verify-phone", "consent", "about-you", "terms", "/workspace"]
+        for _mid_step in range(5):
+            if not continue_url:
+                _print("[Error] 中间步骤丢失 continue_url")
                 return None, None
 
-            select_resp = _post_with_retry(s, "https://auth.openai.com/api/accounts/workspace/select",
-                headers={"referer": continue_url, "accept": "application/json", "content-type": "application/json"},
-                data=json.dumps({"workspace_id": workspace_id}), proxies=proxies, timeout=30, retries=2)
-            _print(f"[*] workspace/select 状态: {select_resp.status_code}")
-            if select_resp.status_code != 200:
+            # --- add-phone / verify-phone: 用已认证 session 重新发起 OAuth ---
+            if "add-phone" in continue_url or "verify-phone" in continue_url:
+                _print("[*] 检测到手机验证页面，使用已认证 session 重新发起 OAuth...")
+                # 先 GET add-phone 页面以加载 session 状态
+                s.get(continue_url, proxies=proxies, verify=_ssl_verify(), timeout=15)
+
+                # 方案1: 用当前已认证 session 发起新的 OAuth authorize 请求
+                # 由于 session cookies 中已有认证信息，OAuth 应该直接 redirect 到 callback
+                re_oauth = generate_oauth_url()
+                _print(f"[*] 重新发起 OAuth 授权...")
+                re_resp = s.get(re_oauth.auth_url, allow_redirects=False,
+                                proxies=proxies, verify=_ssl_verify(), timeout=20)
+
+                # 追踪重定向链，寻找 callback URL
+                re_url = re_oauth.auth_url
+                for re_i in range(15):
+                    location = re_resp.headers.get("Location") or ""
+                    _print(f"[*] re-OAuth #{re_i+1}: status={re_resp.status_code}, loc={location[:120] if location else '(无)'}")
+
+                    if re_resp.status_code in [301, 302, 303, 307, 308] and location:
+                        next_url = urllib.parse.urljoin(re_url, location)
+                        if "code=" in next_url and "state=" in next_url:
+                            _print("[*] 在 re-OAuth 重定向中捕获到 Callback URL!")
+                            token_json = submit_callback_url(
+                                callback_url=next_url, code_verifier=re_oauth.code_verifier,
+                                redirect_uri=re_oauth.redirect_uri, expected_state=re_oauth.state,
+                                proxies=proxies)
+                            return token_json, password
+                        re_url = next_url
+                        re_resp = s.get(re_url, allow_redirects=False,
+                                        proxies=proxies, verify=_ssl_verify(), timeout=20)
+                        continue
+
+                    # 非重定向响应，检查 body 中是否有 callback
+                    if re_resp.status_code == 200:
+                        try:
+                            re_body = re_resp.text[:2000]
+                        except Exception:
+                            re_body = ""
+                        code_match = re.search(r'["\']?(https?://[^"\'\s]*code=[^"\'\s]*)["\']?', re_body)
+                        if code_match:
+                            cb_url = code_match.group(1)
+                            if "state=" in cb_url:
+                                _print("[*] 在 re-OAuth body 中找到 Callback URL!")
+                                token_json = submit_callback_url(
+                                    callback_url=cb_url, code_verifier=re_oauth.code_verifier,
+                                    redirect_uri=re_oauth.redirect_uri, expected_state=re_oauth.state,
+                                    proxies=proxies)
+                                return token_json, password
+
+                        # 检查返回的是否是中间页面，可能需要重新走
+                        try:
+                            re_json = re_resp.json()
+                            new_url = str(re_json.get("continue_url") or "").strip()
+                            if new_url and new_url != continue_url:
+                                _print(f"[*] re-OAuth 返回新 continue_url: {new_url[:80]}")
+                                continue_url = new_url
+                                break
+                        except Exception:
+                            pass
+                    break
+
+                # 如果 re-OAuth 拿到了新的非 add-phone URL，继续中间页面循环
+                if continue_url and "add-phone" not in continue_url and "verify-phone" not in continue_url:
+                    if not any(kw in continue_url for kw in _intermediate_keywords):
+                        break
+                    continue
+
+                # 方案2: 尝试 API 跳过
+                _print("[*] re-OAuth 未成功，尝试 API 跳过...")
+                skip_endpoints = [
+                    ("POST", "https://auth.openai.com/api/accounts/phone/skip", {}),
+                    ("POST", "https://auth.openai.com/api/accounts/phone/later", {}),
+                ]
+                for method, skip_url, skip_body in skip_endpoints:
+                    try:
+                        skip_resp = s.post(skip_url, headers={
+                            "referer": "https://auth.openai.com/add-phone",
+                            "accept": "application/json", "content-type": "application/json",
+                        }, json=skip_body, proxies=proxies, verify=_ssl_verify(), timeout=15)
+                        _print(f"[*] 跳过 ({skip_url.split('/')[-1]}): {skip_resp.status_code}")
+                        if skip_resp.status_code == 200:
+                            try:
+                                new_url = str(skip_resp.json().get("continue_url") or "").strip()
+                                if new_url and "log-in-or-create" not in new_url:
+                                    continue_url = new_url
+                                    _print(f"[*] 跳过成功: {continue_url[:80]}")
+                                    if not any(kw in continue_url for kw in _intermediate_keywords):
+                                        break
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+
+                if continue_url and not any(kw in continue_url for kw in _intermediate_keywords):
+                    if "log-in-or-create" not in continue_url:
+                        break
+
+                _print("[Error] OpenAI 要求手机验证且无法跳过")
                 return None, None
-            try:
-                continue_url = str(select_resp.json().get("continue_url") or "").strip()
-                if continue_url:
-                    _print("[*] workspace 选择成功")
-            except Exception:
-                pass
-            if not continue_url:
-                _print("[Error] workspace/select 缺少 continue_url")
-                return None, None
+
+            # --- codex/consent 或 workspace 选择 ---
+            if any(kw in continue_url for kw in ["codex/consent", "/workspace"]):
+                _print("[*] 进入 workspace 选择流程...")
+                s.get(continue_url, proxies=proxies, verify=_ssl_verify(), timeout=15)
+                auth_cookie = s.cookies.get("oai-client-auth-session")
+                workspace_id = ""
+                if auth_cookie:
+                    for seg in auth_cookie.split("."):
+                        decoded = _decode_jwt_segment(seg)
+                        ws = (decoded.get("workspaces") or []) if decoded else []
+                        if ws:
+                            workspace_id = str((ws[0] or {}).get("id") or "").strip()
+                            break
+                if not workspace_id:
+                    _print("[Error] Cookie 中无 workspace 信息")
+                    return None, None
+
+                select_resp = _post_with_retry(s, "https://auth.openai.com/api/accounts/workspace/select",
+                    headers={"referer": continue_url, "accept": "application/json", "content-type": "application/json"},
+                    data=json.dumps({"workspace_id": workspace_id}), proxies=proxies, timeout=30, retries=2)
+                _print(f"[*] workspace/select 状态: {select_resp.status_code}")
+                if select_resp.status_code != 200:
+                    return None, None
+                try:
+                    continue_url = str(select_resp.json().get("continue_url") or "").strip()
+                    if continue_url:
+                        _print("[*] workspace 选择成功")
+                except Exception:
+                    pass
+                if not continue_url:
+                    _print("[Error] workspace/select 缺少 continue_url")
+                    return None, None
+
+                if not any(kw in continue_url for kw in _intermediate_keywords):
+                    break
+                continue
+
+            # --- 其他中间页面 (about-you / terms / consent) ---
+            if any(kw in continue_url for kw in ["about-you", "terms"]):
+                _print(f"[*] 中间页面: {continue_url.split('/')[-1]}, 尝试推进...")
+                s.get(continue_url, proxies=proxies, verify=_ssl_verify(), timeout=15)
+                try:
+                    skip_resp = s.post("https://auth.openai.com/api/accounts/authorize/continue",
+                        headers={"referer": continue_url, "accept": "application/json",
+                                 "content-type": "application/json"},
+                        json={}, proxies=proxies, verify=_ssl_verify(), timeout=15)
+                    if skip_resp.status_code == 200:
+                        new_url = str(skip_resp.json().get("continue_url") or "").strip()
+                        if new_url:
+                            continue_url = new_url
+                            if not any(kw in continue_url for kw in _intermediate_keywords):
+                                break
+                            continue
+                except Exception:
+                    pass
+                break
+
+            # 不是已知中间页面，跳出
+            break
 
         current_url = continue_url
-        _print(f"[*] 开始重定向追踪...")
-        for redir_i in range(10):
-            final_resp = s.get(current_url, allow_redirects=False, proxies=proxies,
-                               verify=_ssl_verify(), timeout=15)
+        _print(f"[*] 开始重定向追踪... (起始 URL: {continue_url[:80]})")
+        for redir_i in range(15):
+            try:
+                final_resp = s.get(current_url, allow_redirects=False, proxies=proxies,
+                                   verify=_ssl_verify(), timeout=20)
+            except Exception as e:
+                _print(f"[Warn] 重定向第{redir_i+1}跳请求失败: {e}")
+                break
             location = final_resp.headers.get("Location") or ""
+            _print(f"[*] 重定向#{redir_i+1}: status={final_resp.status_code}, location={location[:120] if location else '(无)'}")
             if final_resp.status_code not in [301, 302, 303, 307, 308]:
                 body_text = ""
                 try:
-                    body_text = final_resp.text[:500]
+                    body_text = final_resp.text[:2000]
                 except Exception:
                     pass
+                # 扩展回调URL匹配：同时检查 body 中的 code= 和 meta refresh
                 code_match = re.search(r'["\']?(https?://[^"\'\s]*code=[^"\'\s]*)["\']?', body_text)
                 if code_match:
                     callback_in_body = code_match.group(1)
                     if "state=" in callback_in_body:
+                        _print(f"[*] 在页面 body 中找到 Callback URL")
                         token_json = submit_callback_url(
                             callback_url=callback_in_body, code_verifier=oauth.code_verifier,
                             redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
                             proxies=proxies)
                         return token_json, password
+                # 检查 meta refresh redirect
+                meta_match = re.search(r'<meta[^>]*url=(https?://[^"\'\s>]+)', body_text, re.IGNORECASE)
+                if meta_match:
+                    meta_url = meta_match.group(1)
+                    _print(f"[*] 发现 meta refresh: {meta_url[:100]}")
+                    if "code=" in meta_url and "state=" in meta_url:
+                        token_json = submit_callback_url(
+                            callback_url=meta_url, code_verifier=oauth.code_verifier,
+                            redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
+                            proxies=proxies)
+                        return token_json, password
+                    current_url = meta_url
+                    continue
+                # 检查 JavaScript redirect
+                js_match = re.search(r'(?:window\.location|location\.href)\s*=\s*["\']([^"\']+)["\']', body_text, re.IGNORECASE)
+                if js_match:
+                    js_url = js_match.group(1)
+                    _print(f"[*] 发现 JS redirect: {js_url[:100]}")
+                    if "code=" in js_url and "state=" in js_url:
+                        token_json = submit_callback_url(
+                            callback_url=js_url, code_verifier=oauth.code_verifier,
+                            redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
+                            proxies=proxies)
+                        return token_json, password
+                    if js_url.startswith("http"):
+                        current_url = js_url
+                        continue
+                if redir_i == 0 and final_resp.status_code == 200:
+                    _print(f"[Warn] 首跳返回 200 非重定向，body 前200字符: {body_text[:200]}")
                 break
             if not location:
                 break
             next_url = urllib.parse.urljoin(current_url, location)
             if "code=" in next_url and "state=" in next_url:
+                _print(f"[*] 在 Location header 中捕获到 Callback URL")
                 token_json = submit_callback_url(
                     callback_url=next_url, code_verifier=oauth.code_verifier,
                     redirect_uri=oauth.redirect_uri, expected_state=oauth.state,
@@ -1299,7 +1475,7 @@ def run(proxy: Optional[str], thread_safe: bool = False,
                 return token_json, password
             current_url = next_url
 
-        _print("[Error] 未能在重定向链中捕获到 Callback URL")
+        _print(f"[Error] 未能在重定向链中捕获到 Callback URL (最后 URL: {current_url[:120]})")
         return None, None
 
     except Exception as e:
